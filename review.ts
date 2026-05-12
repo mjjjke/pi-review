@@ -128,6 +128,37 @@ function applyReviewSettings(ctx: ExtensionContext) {
 	reviewCustomInstructions = state.customInstructions?.trim() || undefined;
 }
 
+function isContextBearingEntry(entry: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number]): boolean {
+	return (
+		entry.type === "message" ||
+		entry.type === "custom_message" ||
+		entry.type === "branch_summary" ||
+		entry.type === "compaction"
+	);
+}
+
+function isReviewStateEntry(entry: ReturnType<ExtensionContext["sessionManager"]["getBranch"]>[number]): boolean {
+	return entry.type === "custom" && entry.customType === REVIEW_STATE_TYPE;
+}
+
+function getFreshReviewBaseId(ctx: ExtensionContext): string | undefined {
+	let baseId: string | undefined;
+
+	for (const entry of ctx.sessionManager.getBranch()) {
+		if (isContextBearingEntry(entry)) {
+			break;
+		}
+
+		// Do not inherit stale review-active markers from a previous review branch.
+		// They do not enter LLM context, but they do affect this extension's state.
+		if (!isReviewStateEntry(entry)) {
+			baseId = entry.id;
+		}
+	}
+
+	return baseId;
+}
+
 // Review target types (matching Codex's approach)
 type ReviewTarget =
 	| { type: "uncommitted" }
@@ -1097,44 +1128,41 @@ export default function reviewExtension(pi: ExtensionAPI) {
 			}
 			reviewOriginId = originId;
 
-			// Keep a local copy so session_tree events during navigation don't wipe it
+			// Keep a local copy so session_tree events during navigation don't wipe it.
 			const lockedOriginId = originId;
+			const freshBaseId = getFreshReviewBaseId(ctx);
 
-			// Find the first user message in the session.
-			// If none exists (e.g. brand-new session), we'll stay on the current leaf.
-			const entries = ctx.sessionManager.getEntries();
-			const firstUserMessage = entries.find(
-				(e) => e.type === "message" && e.message.role === "user",
-			);
-
-			if (firstUserMessage) {
-				// Navigate to first user message to create a new branch from that point
-				// Label it as "code-review" so it's visible in the tree
-				try {
-					const result = await ctx.navigateTree(firstUserMessage.id, { summarize: false, label: "code-review" });
+			try {
+				if (freshBaseId) {
+					const result = await ctx.navigateTree(freshBaseId, { summarize: false });
 					if (result.cancelled) {
 						reviewOriginId = undefined;
 						return false;
 					}
-				} catch (error) {
-					// Clean up state if navigation fails
-					reviewOriginId = undefined;
-					ctx.ui.notify(`Failed to start review: ${error instanceof Error ? error.message : String(error)}`, "error");
-					return false;
+				} else {
+					// Extremely old/odd sessions can have only review scaffolding before the
+					// first context-bearing entry. Reset to an actual empty branch rather than
+					// inheriting stale review state.
+					(ctx.sessionManager as unknown as { resetLeaf?: () => void }).resetLeaf?.();
 				}
-
-				// Clear the editor (navigating to user message fills it with the message text)
-				ctx.ui.setEditorText("");
+			} catch (error) {
+				// Clean up state if navigation fails.
+				reviewOriginId = undefined;
+				ctx.ui.notify(`Failed to start review: ${error instanceof Error ? error.message : String(error)}`, "error");
+				return false;
 			}
 
-			// Restore origin after navigation events (session_tree can reset it)
+			// Restore origin after navigation events (session_tree can reset it).
 			reviewOriginId = lockedOriginId;
 
-			// Show widget indicating review is active
+			// Clear any text restored by tree navigation, then mark the fresh branch.
+			ctx.ui.setEditorText("");
 			setReviewWidget(ctx, true);
-
-			// Persist review state so tree navigation can restore/reset it
 			pi.appendEntry(REVIEW_STATE_TYPE, { active: true, originId: lockedOriginId });
+			const reviewBranchId = ctx.sessionManager.getLeafId() ?? undefined;
+			if (reviewBranchId) {
+				pi.setLabel(reviewBranchId, "code-review");
+			}
 		}
 
 		const prompt = await buildReviewPrompt(pi, target);
